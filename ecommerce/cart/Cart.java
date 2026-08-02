@@ -1,6 +1,8 @@
 package LLD2.ecommerce.cart;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Supplier;
 
 /* =====================
    ENUM
@@ -11,16 +13,39 @@ enum CartStatus {
 }
 
 /* =====================
+   EXCEPTIONS
+   ===================== */
+class CartNotFoundException extends RuntimeException {
+    CartNotFoundException(String userId) { super("No active cart for user: " + userId); }
+}
+
+class CartNotActiveException extends RuntimeException {
+    CartNotActiveException(String cartId) { super("Cart is not ACTIVE, cannot modify: " + cartId); }
+}
+
+class InvalidQuantityException extends RuntimeException {
+    InvalidQuantityException(int qty) { super("Quantity must be positive, got: " + qty); }
+}
+
+class EmptyCartException extends RuntimeException {
+    EmptyCartException(String cartId) { super("Cannot checkout empty cart: " + cartId); }
+}
+
+class CartValidationException extends RuntimeException {
+    CartValidationException(String reason) { super("Cart validation failed: " + reason); }
+}
+
+/* =====================
    ENTITIES
    ===================== */
 class User {
-    String userId;
+    final String userId;
     User(String userId) { this.userId = userId; }
 }
 
 class Product {
-    String productId;
-    double price;
+    final String productId;
+    final double price;
 
     Product(String productId, double price) {
         this.productId = productId;
@@ -29,48 +54,85 @@ class Product {
 }
 
 class CartItem {
-    Product product;
-    int quantity;
+    final Product product;
+    private int quantity;
 
     CartItem(Product product, int quantity) {
         this.product = product;
         this.quantity = quantity;
     }
+
+    int getQuantity() { return quantity; }
+
+    void addQuantity(int delta) {
+        int newQty = quantity + delta;
+        if (newQty <= 0) throw new InvalidQuantityException(newQty);
+        quantity = newQty;
+    }
+
+    void setQuantity(int qty) {
+        if (qty <= 0) throw new InvalidQuantityException(qty);
+        quantity = qty;
+    }
 }
 
 class Cart {
-    String cartId;
-    User user;
-    CartStatus status;
-    Map<String, CartItem> items = new HashMap<>();
+    final String cartId;
+    final User user;
+    volatile CartStatus status;
+    final Map<String, CartItem> items = new LinkedHashMap<>();
 
     Cart(String cartId, User user) {
         this.cartId = cartId;
         this.user = user;
         this.status = CartStatus.ACTIVE;
     }
+
+    void assertActive() {
+        if (status != CartStatus.ACTIVE) throw new CartNotActiveException(cartId);
+    }
+
+    boolean isEmpty() { return items.isEmpty(); }
 }
 
 /* =====================
    REPOSITORY
    ===================== */
 interface CartRepository {
-    Cart findByUserId(String userId);
+    Optional<Cart> findByUserId(String userId);
+    Cart getOrCreate(String userId, Supplier<Cart> factory);
     void save(Cart cart);
+    void deleteByUserId(String userId);
 }
 
+/**
+ * Thread-safe in-memory repository.
+ * getOrCreate uses computeIfAbsent to atomically avoid the classic
+ * "read cart -> mutate -> save" race between concurrent requests for
+ * the same new user.
+ */
 class InMemoryCartRepository implements CartRepository {
 
-    private Map<String, Cart> store = new HashMap<>();
+    private final Map<String, Cart> store = new ConcurrentHashMap<>();
 
     @Override
-    public Cart findByUserId(String userId) {
-        return store.get(userId);
+    public Optional<Cart> findByUserId(String userId) {
+        return Optional.ofNullable(store.get(userId));
+    }
+
+    @Override
+    public Cart getOrCreate(String userId, Supplier<Cart> factory) {
+        return store.computeIfAbsent(userId, id -> factory.get());
     }
 
     @Override
     public void save(Cart cart) {
         store.put(cart.user.userId, cart);
+    }
+
+    @Override
+    public void deleteByUserId(String userId) {
+        store.remove(userId);
     }
 }
 
@@ -78,21 +140,49 @@ class InMemoryCartRepository implements CartRepository {
    STRATEGY
    ===================== */
 interface CartValidationStrategy {
-    boolean validate(Cart cart);
+    void validate(Cart cart); // throws CartValidationException on failure
+}
+
+interface InventoryService {
+    boolean isInStock(String productId, int requestedQty);
+}
+
+class InMemoryInventoryService implements InventoryService {
+    private final Map<String, Integer> stock = new ConcurrentHashMap<>();
+
+    void setStock(String productId, int qty) { stock.put(productId, qty); }
+
+    @Override
+    public boolean isInStock(String productId, int requestedQty) {
+        return stock.getOrDefault(productId, 0) >= requestedQty;
+    }
 }
 
 class StockValidationStrategy implements CartValidationStrategy {
-    public boolean validate(Cart cart) {
-        return true; // assume stock ok
+    private final InventoryService inventoryService;
+
+    StockValidationStrategy(InventoryService inventoryService) {
+        this.inventoryService = inventoryService;
+    }
+
+    @Override
+    public void validate(Cart cart) {
+        for (CartItem item : cart.items.values()) {
+            if (!inventoryService.isInStock(item.product.productId, item.getQuantity())) {
+                throw new CartValidationException("Insufficient stock for " + item.product.productId);
+            }
+        }
     }
 }
 
 class PriceValidationStrategy implements CartValidationStrategy {
-    public boolean validate(Cart cart) {
+    @Override
+    public void validate(Cart cart) {
         for (CartItem item : cart.items.values()) {
-            if (item.product.price <= 0) return false;
+            if (item.product.price <= 0) {
+                throw new CartValidationException("Invalid price for " + item.product.productId);
+            }
         }
-        return true;
     }
 }
 
@@ -100,69 +190,115 @@ class PriceValidationStrategy implements CartValidationStrategy {
    SERVICES
    ===================== */
 class CartValidationService {
-    List<CartValidationStrategy> strategies = List.of(
-            new StockValidationStrategy(),
-            new PriceValidationStrategy()
-    );
+    private final List<CartValidationStrategy> strategies;
 
-    boolean validate(Cart cart) {
+    CartValidationService(List<CartValidationStrategy> strategies) {
+        this.strategies = strategies;
+    }
+
+    void validate(Cart cart) {
+        if (cart.isEmpty()) throw new EmptyCartException(cart.cartId);
         for (CartValidationStrategy s : strategies) {
-            if (!s.validate(cart)) return false;
+            s.validate(cart); // throws on failure, short-circuits
         }
-        return true;
     }
 }
 
 class PricingService {
-    double getPrice(Product product) {
-        return product.price;
+    double getTotal(Cart cart) {
+        double total = 0.0;
+        for (CartItem item : cart.items.values()) {
+            total += item.product.price * item.getQuantity();
+        }
+        return total;
     }
+}
+
+interface IdGenerator {
+    String generate();
+}
+
+class UuidGenerator implements IdGenerator {
+    public String generate() { return UUID.randomUUID().toString(); }
 }
 
 class CartService {
 
-    private CartRepository cartRepo = new InMemoryCartRepository();
-    private PricingService pricingService = new PricingService();
-    private CartValidationService validationService = new CartValidationService();
+    private final CartRepository cartRepo;
+    private final PricingService pricingService;
+    private final CartValidationService validationService;
+    private final IdGenerator idGenerator;
 
-    public void addItem(String userId, Product product, int qty) {
-        Cart cart = cartRepo.findByUserId(userId);
+    CartService(CartRepository cartRepo,
+                PricingService pricingService,
+                CartValidationService validationService,
+                IdGenerator idGenerator) {
+        this.cartRepo = cartRepo;
+        this.pricingService = pricingService;
+        this.validationService = validationService;
+        this.idGenerator = idGenerator;
+    }
 
-        if (cart == null) {
-            cart = new Cart(UUID.randomUUID().toString(), new User(userId));
+    public synchronized void addItem(String userId, Product product, int qty) {
+        if (qty <= 0) throw new InvalidQuantityException(qty);
+        Objects.requireNonNull(product, "product must not be null");
+
+        Cart cart = cartRepo.getOrCreate(userId, () -> new Cart(idGenerator.generate(), new User(userId)));
+        cart.assertActive();
+
+        CartItem existing = cart.items.get(product.productId);
+        if (existing == null) {
+            cart.items.put(product.productId, new CartItem(product, qty));
+        } else {
+            existing.addQuantity(qty);
         }
-
-        cart.items.putIfAbsent(
-                product.productId,
-                new CartItem(product, 0)
-        );
-
-        CartItem item = cart.items.get(product.productId);
-        item.quantity += qty;
 
         cartRepo.save(cart);
     }
 
-    public void removeItem(String userId, String productId) {
-        Cart cart = cartRepo.findByUserId(userId);
-        if (cart != null) {
+    public synchronized void updateItemQuantity(String userId, String productId, int newQty) {
+        Cart cart = requireCart(userId);
+        cart.assertActive();
+
+        CartItem item = cart.items.get(productId);
+        if (item == null) return;
+
+        if (newQty <= 0) {
             cart.items.remove(productId);
-            cartRepo.save(cart);
+        } else {
+            item.setQuantity(newQty);
         }
+        cartRepo.save(cart);
+    }
+
+    public synchronized void removeItem(String userId, String productId) {
+        Cart cart = requireCart(userId);
+        cart.assertActive();
+        cart.items.remove(productId);
+        cartRepo.save(cart);
     }
 
     public Cart viewCart(String userId) {
-        return cartRepo.findByUserId(userId);
+        return requireCart(userId);
     }
 
-    public boolean checkout(String userId) {
-        Cart cart = cartRepo.findByUserId(userId);
-        if (cart == null) return false;
+    public double getCartTotal(String userId) {
+        return pricingService.getTotal(requireCart(userId));
+    }
 
-        if (!validationService.validate(cart)) return false;
+    public synchronized boolean checkout(String userId) {
+        Cart cart = requireCart(userId);
+        cart.assertActive();
+
+        validationService.validate(cart); // throws on failure
 
         cart.status = CartStatus.CHECKED_OUT;
         cartRepo.save(cart);
         return true;
+    }
+
+    private Cart requireCart(String userId) {
+        return cartRepo.findByUserId(userId)
+                .orElseThrow(() -> new CartNotFoundException(userId));
     }
 }
